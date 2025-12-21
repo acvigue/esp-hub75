@@ -8,6 +8,7 @@
 // Simplified ring buffer approach with software BCM state tracking.
 
 #include <sdkconfig.h>
+#include <esp_idf_version.h>
 
 // Only compile for ESP32-S3
 #ifdef CONFIG_IDF_TARGET_ESP32S3
@@ -23,13 +24,21 @@
 #include <esp_rom_gpio.h>
 #include <esp_rom_sys.h>
 #include <driver/gpio.h>
+// gpio_func_sel() requires private GPIO header in ESP-IDF 5.4+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
 #include <esp_private/gpio.h>
+#endif
 #include <esp_private/gdma.h>
 #include <soc/gpio_sig_map.h>
 #include <soc/lcd_cam_struct.h>
 #include <hal/gpio_hal.h>
 #include <hal/gdma_ll.h>
+// Header location changed in ESP-IDF 5.0
+#if (ESP_IDF_VERSION_MAJOR >= 5)
 #include <esp_private/periph_ctrl.h>
+#else
+#include <driver/periph_ctrl.h>
+#endif
 #include <esp_heap_caps.h>
 
 static const char *const TAG = "GdmaDma";
@@ -119,11 +128,14 @@ bool GdmaDma::init() {
 
   // Allocate GDMA channel
   ESP_EARLY_LOGI("GDMA", "About to allocate GDMA channel");
-  gdma_channel_alloc_config_t dma_alloc_config = {.sibling_chan = nullptr,
-                                                  .direction = GDMA_CHANNEL_DIRECTION_TX,
-                                                  .flags = {.reserve_sibling = 0, .isr_cache_safe = 0}};
+  gdma_channel_alloc_config_t dma_alloc_config = {
+      .sibling_chan = nullptr, .direction = GDMA_CHANNEL_DIRECTION_TX, .flags = {.reserve_sibling = 0}};
 
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
   esp_err_t err = gdma_new_ahb_channel(&dma_alloc_config, &dma_chan_);
+#else
+  esp_err_t err = gdma_new_channel(&dma_alloc_config, &dma_chan_);
+#endif
   if (err != ESP_OK) {
     ESP_EARLY_LOGE("GDMA", "FAILED to allocate GDMA channel: 0x%x", err);
     ESP_LOGE(TAG, "Failed to allocate GDMA channel: %s", esp_err_to_name(err));
@@ -137,20 +149,25 @@ bool GdmaDma::init() {
   // Configure GDMA strategy
   // owner_check = false: Static descriptors, no dynamic ownership handshaking needed
   // auto_update_desc = false: No descriptor writeback - prevents corruption with infinite ring
-  // eof_till_data_popped = true: EOF fires after LCD consumes data (includes display period timing!)
-  //   This is CRITICAL for proper BCM timing - EOF waits for the OE=LOW display period to complete
-  gdma_strategy_config_t strategy_config = {
-      .owner_check = false, .auto_update_desc = false, .eof_till_data_popped = true};
+  gdma_strategy_config_t strategy_config = {.owner_check = false, .auto_update_desc = false};
   gdma_apply_strategy(dma_chan_, &strategy_config);
 
-  ESP_LOGI(TAG, "GDMA strategy configured: owner_check=false, auto_update_desc=false, eof_till_data_popped=true");
+  ESP_LOGI(TAG, "GDMA strategy configured: owner_check=false, auto_update_desc=false");
 
   // Configure GDMA transfer for SRAM (not PSRAM)
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
   gdma_transfer_config_t transfer_config = {
       .max_data_burst_size = 32,  // 32 bytes for SRAM
       .access_ext_mem = false     // Not accessing external memory
   };
   gdma_config_transfer(dma_chan_, &transfer_config);
+#else
+  gdma_transfer_ability_t ability = {
+      .sram_trans_align = 32,
+      .psram_trans_align = 64,
+  };
+  gdma_set_transfer_ability(dma_chan_, &ability);
+#endif
 
   // Wait for any pending LCD operations
   while (LCD_CAM.lcd_user.lcd_start)
@@ -271,7 +288,11 @@ void GdmaDma::configure_gpio() {
   for (int i = 0; i < 16; i++) {
     if (data_pins[i] >= 0) {
       esp_rom_gpio_connect_out_signal(data_pins[i], LCD_DATA_OUT0_IDX + i, false, false);
-      gpio_func_sel((gpio_num_t) data_pins[i], PIN_FUNC_GPIO);                 // ESP-IDF 5.4+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+      gpio_func_sel((gpio_num_t) data_pins[i], PIN_FUNC_GPIO);
+#else
+      gpio_hal_iomux_func_sel(GPIO_PIN_MUX_REG[data_pins[i]], PIN_FUNC_GPIO);
+#endif
       gpio_set_drive_capability((gpio_num_t) data_pins[i], GPIO_DRIVE_CAP_3);  // Max drive strength
     }
   }
@@ -279,7 +300,11 @@ void GdmaDma::configure_gpio() {
   // Configure WR (clock) pin
   if (config_.pins.clk >= 0) {
     esp_rom_gpio_connect_out_signal(config_.pins.clk, LCD_PCLK_IDX, config_.clk_phase_inverted, false);
-    gpio_func_sel((gpio_num_t) config_.pins.clk, PIN_FUNC_GPIO);                 // ESP-IDF 5.4+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+    gpio_func_sel((gpio_num_t) config_.pins.clk, PIN_FUNC_GPIO);
+#else
+    gpio_hal_iomux_func_sel(GPIO_PIN_MUX_REG[config_.pins.clk], PIN_FUNC_GPIO);
+#endif
     gpio_set_drive_capability((gpio_num_t) config_.pins.clk, GPIO_DRIVE_CAP_3);  // Max drive strength
   }
 
@@ -1023,9 +1048,10 @@ void GdmaDma::calculate_bcm_timings() {
 }
 
 // ============================================================================
-// Compile-Time Validation
+// Compile-Time Validation (ESP-IDF 5.x only - requires consteval/GCC 9+)
 // ============================================================================
 
+#if ESP_IDF_VERSION_MAJOR >= 5
 namespace {
 
 // Validate BCM calculations produce exact expected counts
@@ -1072,6 +1098,7 @@ static_assert(test_bcm_8bit_transition1(), "BCM: 8-bit/transition=1 should produ
 static_assert(test_bcm_8bit_transition2(), "BCM: 8-bit/transition=2 should produce 39 transmissions");
 
 }  // namespace
+#endif  // ESP_IDF_VERSION_MAJOR >= 5
 
 }  // namespace hub75
 

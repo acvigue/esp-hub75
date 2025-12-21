@@ -1,6 +1,18 @@
 # ESP32 HUB75 DMA Driver
 # CMakeLists.txt for ESP-IDF component
 
+# Build REQUIRES list conditionally (esp_mm only exists in ESP-IDF 5.x for P4/C6)
+# Use IDF_TARGET (CMake variable) not CONFIG_IDF_TARGET_* (Kconfig, not yet available)
+set(HUB75_REQUIRES
+    driver
+    esp_timer
+    esp_hw_support
+    freertos
+)
+if(IDF_TARGET STREQUAL "esp32p4" OR IDF_TARGET STREQUAL "esp32c6")
+    list(APPEND HUB75_REQUIRES esp_mm)
+endif()
+
 idf_component_register(
     SRCS
         "src/core/hub75_driver.cpp"
@@ -14,11 +26,7 @@ idf_component_register(
         "include"
         "src"
     REQUIRES
-        driver
-        esp_timer
-        esp_mm
-        esp_hw_support
-        freertos
+        ${HUB75_REQUIRES}
 )
 
 # Platform-specific source files
@@ -75,5 +83,6 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE
     LOG_LOCAL_LEVEL=ESP_LOG_DEBUG
 )
 
-# Require C++20 for [[likely]]/[[unlikely]], consteval, and other modern features
+# Require C++20 for [[likely]]/[[unlikely]] and other modern features
+# Note: consteval validation is skipped on ESP-IDF 4.x (GCC 8.x) via version guards
 target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_20)

@@ -10,6 +10,7 @@
 
 #include "hub75_types.h"
 #include "hub75_config.h"
+#include <esp_idf_version.h>
 
 namespace hub75 {
 
@@ -75,9 +76,10 @@ class ScanPatternRemap {
 };
 
 // ============================================================================
-// Compile-Time Validation
+// Compile-Time Validation (ESP-IDF 5.x only - requires consteval/GCC 9+)
 // ============================================================================
 
+#if ESP_IDF_VERSION_MAJOR >= 5
 namespace {  // Anonymous namespace for compile-time validation
 
 // Validate standard scan is identity transform
@@ -104,5 +106,6 @@ static_assert(test_standard_scan_identity(), "Standard scan must be identity tra
 static_assert(test_four_scan_no_overflow(), "Four-scan patterns produce out-of-bounds coordinates");
 
 }  // namespace
+#endif  // ESP_IDF_VERSION_MAJOR >= 5
 
 }  // namespace hub75

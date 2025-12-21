@@ -160,9 +160,10 @@ class PanelLayoutRemap {
 };
 
 // ============================================================================
-// Compile-Time Validation
+// Compile-Time Validation (ESP-IDF 5.x only - requires consteval/GCC 9+)
 // ============================================================================
 
+#if ESP_IDF_VERSION_MAJOR >= 5
 namespace {  // Anonymous namespace for compile-time validation
 
 // Helper: Check if two coordinates are equal
@@ -445,5 +446,6 @@ static_assert(test_top_right_down_vertical_2x1(), "TOP_RIGHT_DOWN vertical stack
 static_assert(test_bottom_left_up_vertical_2x1(), "BOTTOM_LEFT_UP vertical stack exceeds DMA buffer bounds");
 
 }  // namespace
+#endif  // ESP_IDF_VERSION_MAJOR >= 5
 
 }  // namespace hub75

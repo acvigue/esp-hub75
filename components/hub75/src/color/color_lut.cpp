@@ -6,11 +6,13 @@
 
 #include "color_lut.h"
 #include <cstddef>
+#include <esp_idf_version.h>
 
 // ============================================================================
-// Compile-Time Validation
+// Compile-Time Validation (ESP-IDF 5.x only - requires consteval/GCC 9+)
 // ============================================================================
 
+#if ESP_IDF_VERSION_MAJOR >= 5
 namespace {
 
 // Validate LUT monotonicity (gamma curves should be non-decreasing)
@@ -46,3 +48,4 @@ static_assert(validate_lut_bounds(), "LUT values exceed bit depth max");
 static_assert(validate_lut_endpoints(), "LUT endpoints incorrect (should be 0 and max)");
 
 }  // namespace
+#endif  // ESP_IDF_VERSION_MAJOR >= 5
