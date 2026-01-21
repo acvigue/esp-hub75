@@ -11,9 +11,6 @@
 #include <esp_idf_version.h>
 #include <soc/soc_caps.h>  // For SOC_PARLIO_SUPPORTED and SOC_PARLIO_TX_CLK_SUPPORT_GATING
 
-// Uncomment to enable brightness OE validation (compile-time and runtime checks)
-// #define DEBUG_BRIGHTNESS_OE_VALIDATION
-
 // Only compile for chips with PARLIO peripheral (ESP32-P4, ESP32-C6, etc.)
 #ifdef SOC_PARLIO_SUPPORTED
 
@@ -24,7 +21,6 @@
 #include <cassert>
 #include <cstring>
 #include <algorithm>
-#include <vector>
 #include <esp_log.h>
 #include <driver/gpio.h>
 #include <esp_heap_caps.h>
@@ -64,91 +60,6 @@ constexpr uint16_t RGB_MASK = RGB_UPPER_MASK | RGB_LOWER_MASK;  // 0x003F
 // Bit clear masks
 constexpr uint16_t OE_CLEAR_MASK = ~(1 << OE_BIT);
 constexpr uint16_t RGB_CLEAR_MASK = ~RGB_MASK;  // Clear RGB bits 0-5
-
-// ============================================================================
-// Compile-Time Validation Helpers
-// ============================================================================
-
-// Calculate BCM repetition factor for a bit plane
-static constexpr int calculate_bcm_repetitions(int bit, int lsb_msb_transition) {
-  return (bit <= lsb_msb_transition) ? 1 : (1 << (bit - lsb_msb_transition - 1));
-}
-
-// Calculate expected padding size for a bit plane
-static constexpr int calculate_expected_padding(int bit, int lsb_msb_transition, int base_display, int latch_blanking) {
-  const int reps = calculate_bcm_repetitions(bit, lsb_msb_transition);
-  return latch_blanking + (reps * base_display);
-}
-
-// Calculate expected BCM ratio between consecutive MSB bits (should be 2.0)
-static constexpr float calculate_bcm_ratio(int bit, int prev_bit, int lsb_msb_transition) {
-  if (bit <= lsb_msb_transition || prev_bit <= lsb_msb_transition) {
-    return 1.0f;  // LSB bits don't follow BCM scaling
-  }
-  const int curr_reps = calculate_bcm_repetitions(bit, lsb_msb_transition);
-  const int prev_reps = calculate_bcm_repetitions(prev_bit, lsb_msb_transition);
-  return (float) curr_reps / (float) prev_reps;
-}
-
-#ifdef DEBUG_BRIGHTNESS_OE_VALIDATION
-// Runtime validation function to verify brightness OE calculations
-// Validates that BCM padding ratios are correct
-static void validate_brightness_oe_calculations(int bit_depth, int lsb_msb_transition, int dma_width,
-                                                int latch_blanking, const int *max_display_array,
-                                                const int *max_displays) {
-  (void) max_displays;  // Same as max_display_array in simplified formula
-  ESP_LOGI(TAG, "=== BRIGHTNESS OE VALIDATION (No Rightshift) ===");
-
-  // Verify max_display matches expected padding_available
-  const int base_pixels = dma_width - latch_blanking;
-  for (int bit = 0; bit < bit_depth; bit++) {
-    // Calculate expected padding
-    int reps;
-    if (bit <= lsb_msb_transition) {
-      reps = 1;
-    } else {
-      reps = 1 << (bit - lsb_msb_transition - 1);
-    }
-    const int expected_padding = reps * base_pixels;
-
-    if (max_display_array[bit] != expected_padding) {
-      ESP_LOGE(TAG, "VALIDATION FAILED: Bit %d max_display=%d, expected %d", bit, max_display_array[bit],
-               expected_padding);
-    }
-  }
-  ESP_LOGI(TAG, "✓ All max_display values match expected padding");
-
-  // Check BCM ratios between consecutive MSB bits (should be 2.0)
-  for (int bit = lsb_msb_transition + 2; bit < bit_depth; bit++) {
-    const int prev_bit = bit - 1;
-
-    // Calculate padding sizes
-    const int curr_reps = calculate_bcm_repetitions(bit, lsb_msb_transition);
-    const int prev_reps = calculate_bcm_repetitions(prev_bit, lsb_msb_transition);
-    const int curr_padding = calculate_expected_padding(bit, lsb_msb_transition, base_pixels, latch_blanking);
-    const int prev_padding = calculate_expected_padding(prev_bit, lsb_msb_transition, base_pixels, latch_blanking);
-
-    // BCM ratio via padding (should be 2.0)
-    const float padding_ratio = (float) curr_padding / (float) prev_padding;
-
-    // Display ratio (may be 1.0 or 2.0 depending on rightshift)
-    const float display_ratio =
-        (max_displays[prev_bit] > 0) ? (float) max_displays[bit] / (float) max_displays[prev_bit] : 0.0f;
-
-    ESP_LOGI(TAG, "Bit %d→%d: padding_ratio=%.2f (reps %d→%d), display_ratio=%.2f (max %d→%d)", prev_bit, bit,
-             padding_ratio, prev_reps, curr_reps, display_ratio, max_displays[prev_bit], max_displays[bit]);
-
-    // Padding ratio should always be 2.0 for consecutive MSB bits
-    if (padding_ratio < 1.95f || padding_ratio > 2.05f) {
-      ESP_LOGE(TAG, "VALIDATION FAILED: BCM padding ratio for bit %d→%d is %.2f (expected 2.0)", prev_bit, bit,
-               padding_ratio);
-    }
-  }
-  ESP_LOGI(TAG, "✓ BCM padding ratios correct");
-
-  ESP_LOGI(TAG, "=== VALIDATION COMPLETE ===");
-}
-#endif  // DEBUG_BRIGHTNESS_OE_VALIDATION
 
 ParlioDma::ParlioDma(const Hub75Config &config)
     : PlatformDma(config),
@@ -660,19 +571,11 @@ void ParlioDma::initialize_blank_buffers() {
 }
 
 void ParlioDma::set_brightness_oe_internal(BitPlaneBuffer *buffers, uint8_t brightness) {
-#ifdef DEBUG_BRIGHTNESS_OE_VALIDATION
-  // Validation arrays: store adjusted_base_pixels and max_display for each bit plane
-  std::vector<int> adjusted_base_array(bit_depth_, 0);
-  std::vector<int> max_displays(bit_depth_, 0);
-#endif
-
   // Special case: brightness=0 means fully blanked (display off)
   if (brightness == 0) {
     for (int row = 0; row < num_rows_; row++) {
       for (int bit = 0; bit < bit_depth_; bit++) {
-        int idx = (row * bit_depth_) + bit;
-        BitPlaneBuffer &bp = buffers[idx];
-
+        BitPlaneBuffer &bp = buffers[(row * bit_depth_) + bit];
         // Blank all pixels in padding section: set OE bit HIGH
         for (size_t i = 0; i < bp.padding_words; i++) {
           bp.data[bp.pixel_words + i] |= (1 << OE_BIT);
@@ -682,10 +585,30 @@ void ParlioDma::set_brightness_oe_internal(BitPlaneBuffer *buffers, uint8_t brig
     return;
   }
 
+  // Minimum brightness floor to maintain BCM ratios
+  //
+  // Problem: At low brightness (e.g., brightness=4), the formula
+  //   display_count = (max_display * brightness) >> 8
+  // truncates multiple bit planes to the SAME value (e.g., all = 1), destroying
+  // the 1:2:4:8:16:32 BCM ratios that create correct colors.
+  //
+  // Solution: Calculate minimum brightness where MSB bit (bit 7) gets ≥8 display_count.
+  // With 8 words, bits 5-7 can have ratios 8:4:2, preserving 3-bit color depth.
+  // Lower bits (0-4) contribute less visually due to CIE correction anyway.
+  //
+  // Formula: brightness >= (8 * 256) / base_display
+  // For 128-wide panel: min = 16, for 64-wide: min = 33, for 256-wide: min = 8
+  const int base_display = dma_width_ - config_.latch_blanking;
+  const int min_brightness = std::min(255, (8 * 256 + base_display - 1) / base_display);
+
+  // Remap user brightness (1-255) linearly to valid range (min_brightness-255)
+  // This preserves all 255 brightness levels while ensuring BCM ratios work correctly.
+  // User sees smooth dimming; internally we never go below the minimum.
+  const int effective_brightness = min_brightness + ((brightness * (255 - min_brightness)) / 255);
+
   for (int row = 0; row < num_rows_; row++) {
     for (int bit = 0; bit < bit_depth_; bit++) {
-      int idx = (row * bit_depth_) + bit;
-      BitPlaneBuffer &bp = buffers[idx];
+      BitPlaneBuffer &bp = buffers[(row * bit_depth_) + bit];
 
       // For PARLIO with clock gating, brightness is controlled by OE duty cycle
       // in the padding section (where MSB=0 and panel displays)
@@ -708,25 +631,33 @@ void ParlioDma::set_brightness_oe_internal(BitPlaneBuffer *buffers, uint8_t brig
 
       const int padding_available = bp.padding_words - config_.latch_blanking;
 
-      // PARLIO brightness: Use full padding proportionally (no rightshift)
+      // PARLIO Hybrid BCM Approach
       //
-      // Unlike GDMA (which uses rightshift + descriptor repetition), PARLIO achieves
-      // BCM timing purely through variable padding sizes. The padding SIZE is the timing.
+      // PARLIO differs from GDMA/I2S: BCM timing comes from PADDING SIZE, not descriptor
+      // repetitions. Each bit plane has different padding (bit 7 has 32x more than bit 2).
       //
-      // Applying GDMA's rightshift here would crush bits 1-2, causing severe color
-      // imbalance in dark pixels → rainbow artifacts.
+      // This creates a TWO-TIER system:
       //
-      // Instead, use full padding for all MSB bits. LSB bits (0-1) already have reduced
-      // contribution via lsbMsbTransitionBit (no BCM scaling).
-      const int max_display = padding_available;
-
-#ifdef DEBUG_BRIGHTNESS_OE_VALIDATION
-      // Store values for validation (only for row 0 to avoid duplication)
-      if (row == 0) {
-        adjusted_base_array[bit] = max_display;  // Store max_display for validation
-        max_displays[bit] = max_display;
+      // MSB bits (> lsbMsbTransitionBit): Padding size provides BCM weighting
+      //   - Bit 7 has 32x more padding than bit 2 → inherently 32x longer display time
+      //   - Using rightshift here would DOUBLE-WEIGHT them (padding ratio × OE ratio)
+      //   - Solution: Use full padding_available, let padding size control BCM
+      //
+      // LSB bits (≤ lsbMsbTransitionBit): All have IDENTICAL padding (base_padding)
+      //   - Without differentiation, bits 0 and 1 would contribute equally → wrong colors
+      //   - Solution: Apply rightshift to reduce max_display for lower bits
+      //   - Same formula as GDMA/I2S for these bits
+      int max_display;
+      if (bit <= lsbMsbTransitionBit_) {
+        // LSB bits: identical padding, need rightshift for BCM differentiation
+        const int bitplane = bit_depth_ - 1 - bit;
+        const int bitshift = (bit_depth_ - lsbMsbTransitionBit_ - 1) >> 1;
+        const int rightshift = std::max(bitplane - bitshift - 2, 0);
+        max_display = padding_available >> rightshift;
+      } else {
+        // MSB bits: padding size provides BCM timing, no rightshift needed
+        max_display = padding_available;
       }
-#endif
 
       // Safety check: ensure we have enough headroom for safety margin
       if (max_display < 2) {
@@ -737,10 +668,23 @@ void ParlioDma::set_brightness_oe_internal(BitPlaneBuffer *buffers, uint8_t brig
         continue;
       }
 
-      int display_count = (max_display * brightness) >> 8;
+      int display_count = (max_display * effective_brightness) >> 8;
 
-      // Ensure at least 1 word for brightness > 0
-      if (brightness > 0 && display_count == 0) {
+      // Safety net: Hybrid minimum for edge cases (e.g., 12-bit depth, unusual latch_blanking)
+      //
+      // The brightness floor above should prevent display_count=0 for most cases.
+      // This catches edge cases where high rightshift values (at higher bit depths)
+      // could still result in display_count=0 for lower bits.
+      //
+      // Gradually include more bits: at low brightness only MSB gets minimum=1,
+      // preserving color ratios for visible bits. As brightness increases, more
+      // bits naturally exceed 0 anyway.
+      // Formula: min_bit = (bit_depth-1) - (brightness/16)
+      //   brightness 1-15:  only bit 7 gets minimum
+      //   brightness 16-31: bits 6-7 get minimum
+      //   brightness 32-47: bits 5-7 get minimum, etc.
+      const int min_bit_for_display = std::max(0, bit_depth_ - 1 - (effective_brightness >> 4));
+      if (effective_brightness > 0 && display_count == 0 && bit >= min_bit_for_display) {
         display_count = 1;
       }
 
@@ -748,8 +692,8 @@ void ParlioDma::set_brightness_oe_internal(BitPlaneBuffer *buffers, uint8_t brig
       display_count = std::min(display_count, max_display - 1);
 
       // Center the display window in padding section
-      const int start_display = (bp.padding_words - display_count) / 2;
-      const int end_display = start_display + display_count;
+      const size_t start_display = (bp.padding_words - display_count) / 2;
+      const size_t end_display = start_display + display_count;
 
       // Set OE bits in padding section
       for (size_t i = 0; i < bp.padding_words; i++) {
@@ -767,17 +711,10 @@ void ParlioDma::set_brightness_oe_internal(BitPlaneBuffer *buffers, uint8_t brig
       // CRITICAL: Latch blanking at end of padding
       // Blank last N words to prevent ghosting during row transition
       for (size_t i = 0; i < config_.latch_blanking && i < bp.padding_words; i++) {
-        size_t idx = bp.padding_words - 1 - i;
-        bp.data[bp.pixel_words + idx] |= (1 << OE_BIT);
+        bp.data[bp.pixel_words + bp.padding_words - 1 - i] |= (1 << OE_BIT);
       }
     }
   }
-
-#ifdef DEBUG_BRIGHTNESS_OE_VALIDATION
-  // Validate BCM padding calculations (only call once, not per-row)
-  validate_brightness_oe_calculations(bit_depth_, lsbMsbTransitionBit_, dma_width_, config_.latch_blanking,
-                                      adjusted_base_array.data(), max_displays.data());
-#endif
 }
 
 void ParlioDma::set_brightness_oe() {

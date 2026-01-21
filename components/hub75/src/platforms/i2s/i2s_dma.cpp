@@ -610,8 +610,11 @@ void I2sDma::set_rotation(Hub75Rotation rotation) { rotation_ = rotation; }
 // ============================================================================
 
 // Calculate number of transmissions per row for BCM timing
+// Must match the actual descriptor allocation in build_descriptor_chain():
+//   bits <= transition: 1 descriptor each
+//   bits > transition: 2^(bit - transition - 1) descriptors each
 HUB75_CONST constexpr int I2sDma::calculate_bcm_transmissions(int bit_depth, int lsb_msb_transition) {
-  int transmissions = bit_depth;  // Base: all bits shown once
+  int transmissions = lsb_msb_transition + 1;  // Bits 0 to transition: 1 each
 
   // Add BCM repetitions for bits above transition
   for (int i = lsb_msb_transition + 1; i < bit_depth; ++i) {
@@ -734,6 +737,41 @@ void I2sDma::initialize_blank_buffers() {
   ESP_LOGI(TAG, "Blank buffers initialized");
 }
 
+// Configure OE (Output Enable) bits in DMA buffers to control brightness.
+//
+// Architecture: BCM timing vs OE duty cycle
+// ------------------------------------------
+// Binary Code Modulation (BCM) creates color depth by displaying each bit plane
+// for a time proportional to its binary weight. This driver achieves BCM timing
+// through DMA descriptor repetition:
+//   - Bit 7 (MSB): 32 descriptors → displayed 32× longer
+//   - Bit 6: 16 descriptors → displayed 16× longer
+//   - ...
+//   - Bit 0 (LSB): 1 descriptor → displayed 1×
+//
+// The OE signal controls whether LEDs are actually lit during each bit plane's
+// transmission. By keeping OE HIGH (disabled) for part of each transmission,
+// we reduce perceived brightness WITHOUT changing BCM ratios.
+//
+// Key insight: Since BCM ratios come from descriptor repetition, OE duty cycle
+// is applied UNIFORMLY to all bit planes. Each bit plane has the same percentage
+// of pixels with OE=LOW (enabled). This dims the display while preserving color
+// accuracy.
+//
+// Center-based OE placement
+// -------------------------
+// The enabled region (OE=LOW) is centered in the buffer rather than left-aligned.
+// This provides symmetric blanking margins on both sides, which:
+//   1. Keeps the display period away from buffer edges where timing is less stable
+//   2. Provides natural separation from the LAT pulse at the end
+//   3. Distributes any timing jitter symmetrically
+//
+// I2S FIFO byte reordering
+// ------------------------
+// The I2S peripheral reorders bytes within 32-bit words due to FIFO packing.
+// All buffer accesses use fifo_adjust_x() to compensate for this reordering,
+// ensuring pixels appear in the correct order on the panel.
+//
 void I2sDma::set_brightness_oe_internal(RowBitPlaneBuffer *buffers, uint8_t brightness) {
   if (!buffers) {
     return;
@@ -741,12 +779,11 @@ void I2sDma::set_brightness_oe_internal(RowBitPlaneBuffer *buffers, uint8_t brig
 
   const uint8_t latch_blanking = config_.latch_blanking;
 
-  // Special case: brightness=0 means fully blanked (display off)
+  // brightness=0 blanks the display entirely
   if (brightness == 0) {
     for (int row = 0; row < num_rows_; row++) {
       for (int bit = 0; bit < bit_depth_; bit++) {
         uint16_t *buf = (uint16_t *) (buffers[row].data + (bit * dma_width_ * 2));
-        // Blank all pixels: set OE bit HIGH
         for (int x = 0; x < dma_width_; x++) {
           buf[fifo_adjust_x(x)] |= (1 << OE_BIT);
         }
@@ -755,55 +792,90 @@ void I2sDma::set_brightness_oe_internal(RowBitPlaneBuffer *buffers, uint8_t brig
     return;
   }
 
+  // Minimum brightness floor
+  //
+  // At very low brightness, the formula `display_pixels = (max_pixels * brightness) >> 8`
+  // can round down to the same small value for multiple bit planes, destroying BCM ratios.
+  // For example, if all bit planes get display_pixels=1, they contribute equally instead
+  // of the 1:2:4:8:16:32 ratios needed for correct colors.
+  //
+  // The floor ensures the MSB gets at least 8 display_pixels, allowing bits 5-7 to maintain
+  // distinguishable ratios (8:4:2). Lower bits contribute minimally to perceived brightness
+  // due to CIE gamma correction, so this trade-off preserves visual color accuracy.
+  //
+  // Formula: min_brightness = ceil((8 * 256) / max_pixels)
+  //   128-wide panel: min = 17 → 8+ display pixels
+  //   64-wide panel:  min = 33 → 8+ display pixels
+  //   256-wide panel: min = 8  → 8+ display pixels
+  const int max_pixels_no_shift = dma_width_ - latch_blanking;
+  const int min_brightness = std::min(255, (8 * 256 + max_pixels_no_shift - 1) / max_pixels_no_shift);
+
+  // Remap user brightness (1-255) to effective range (min_brightness-255)
+  // This preserves all 255 user-visible brightness levels while ensuring the internal
+  // value never drops below the floor. The remapping is linear, so dimming appears smooth.
+  const int effective_brightness = min_brightness + ((brightness * (255 - min_brightness)) / 255);
+
   for (int row = 0; row < num_rows_; row++) {
     for (int bit = 0; bit < bit_depth_; bit++) {
-      // Get pointer to this bit plane's buffer
       uint16_t *buf = (uint16_t *) (buffers[row].data + (bit * dma_width_ * 2));
 
-      // Calculate BCM weighting for this bit plane
-      const int bitplane = (2 * bit_depth_ - bit) % bit_depth_;
-      const int bitshift = (bit_depth_ - lsbMsbTransitionBit_ - 1) >> 1;
-      const int rightshift = std::max(bitplane - bitshift - 2, 0);
+      // Uniform OE duty cycle: same display_pixels count for all bit planes.
+      // BCM ratios come from descriptor repetition, not OE timing.
+      const int max_pixels = dma_width_ - latch_blanking;
+      int display_pixels = (max_pixels * effective_brightness) >> 8;
 
-      // Calculate display pixel count for this bit plane
-      const int max_pixels = (dma_width_ - latch_blanking) >> rightshift;
-      int display_pixels = (max_pixels * brightness) >> 8;
-
-      // Ensure at least 1 pixel for brightness > 0
-      if (brightness > 0 && display_pixels == 0) {
+      // Edge case fallback for very low brightness
+      //
+      // Even with the brightness floor, integer truncation can result in display_pixels=0
+      // for some configurations. This fallback ensures at least 1 pixel is enabled for
+      // the most significant bits, which contribute most to perceived brightness.
+      //
+      // The threshold increases with brightness: at very low brightness only bit 7 gets
+      // the minimum; as brightness increases, more bits naturally exceed 0 anyway.
+      //   effective_brightness 1-15:   only bit 7 guaranteed minimum
+      //   effective_brightness 16-31:  bits 6-7 guaranteed minimum
+      //   effective_brightness 32-47:  bits 5-7 guaranteed minimum, etc.
+      const int min_bit_for_display = std::max(0, bit_depth_ - 1 - (effective_brightness >> 4));
+      if (effective_brightness > 0 && display_pixels == 0 && bit >= min_bit_for_display) {
         display_pixels = 1;
       }
 
-      // Safety margin to prevent ghosting
+      // Reserve at least 1 pixel blanking to prevent ghosting at maximum brightness.
+      // Without this margin, brightness=255 would enable all pixels including those
+      // near the LAT pulse, potentially causing visible artifacts.
       display_pixels = std::min(display_pixels, max_pixels - 1);
 
-      // Calculate center region for OE=LOW (display enabled)
+      // Center the enabled region in the buffer
       const int x_min = (dma_width_ - display_pixels) / 2;
       const int x_max = (dma_width_ + display_pixels) / 2;
 
-      // Set OE bits: LOW in center (display), HIGH elsewhere (blanked)
+      // Apply OE pattern: LOW (enabled) in center, HIGH (blanked) elsewhere
       for (int x = 0; x < dma_width_; x++) {
         if (x >= x_min && x < x_max) {
-          // Enable display: clear OE bit
           buf[fifo_adjust_x(x)] &= OE_CLEAR_MASK;
         } else {
-          // Keep blanked: set OE bit
           buf[fifo_adjust_x(x)] |= (1 << OE_BIT);
         }
       }
 
-      // CRITICAL: Latch blanking to prevent ghosting
+      // Latch blanking: force OE=HIGH around the LAT pulse
+      //
+      // The LAT (latch) signal on the last pixel transfers shift register data to the
+      // display buffer. The panel needs the display blanked during this transition to
+      // prevent visible artifacts from partially-latched data. Blanking pixels at both
+      // the start and end of the buffer ensures clean transitions regardless of where
+      // the centered display region falls.
       const int last_pixel = dma_width_ - 1;
 
-      // Blank LAT pixel itself
+      // Blank the LAT pixel itself (always required)
       buf[fifo_adjust_x(last_pixel)] |= (1 << OE_BIT);
 
-      // Blank latch_blanking pixels BEFORE LAT
+      // Blank latch_blanking pixels before LAT
       for (int i = 1; i <= latch_blanking && (last_pixel - i) >= 0; i++) {
         buf[fifo_adjust_x(last_pixel - i)] |= (1 << OE_BIT);
       }
 
-      // Blank latch_blanking pixels at START of buffer
+      // Blank latch_blanking pixels at buffer start (for wrap-around from previous row)
       for (int i = 0; i < latch_blanking && i < dma_width_; i++) {
         buf[fifo_adjust_x(i)] |= (1 << OE_BIT);
       }
@@ -1209,48 +1281,44 @@ void I2sDma::flip_buffer() {
 #if ESP_IDF_VERSION_MAJOR >= 5
 namespace {
 
-// Validate BCM calculations produce exact expected counts
+// Validate BCM calculations match actual descriptor allocation
+// Formula: (transition + 1) base + sum of 2^(i - transition - 1) for i > transition
 consteval bool test_bcm_12bit_transition0() {
-  // Worst case: 12-bit depth, transition=0
-  // 12 + (1+2+4+8+16+32+64+128+256+512+1024) = 12 + 2047 = 2059
+  // 12-bit depth, transition=0: 1 + (1+2+4+8+16+32+64+128+256+512+1024) = 1 + 2047 = 2048
   constexpr int transmissions = I2sDma::calculate_bcm_transmissions(12, 0);
-  return transmissions == 2059;
+  return transmissions == 2048;
 }
 
 consteval bool test_bcm_10bit_transition0() {
-  // 10-bit depth, transition=0
-  // 10 + (1+2+4+8+16+32+64+128+256) = 10 + 511 = 521
+  // 10-bit depth, transition=0: 1 + (1+2+4+8+16+32+64+128+256) = 1 + 511 = 512
   constexpr int transmissions = I2sDma::calculate_bcm_transmissions(10, 0);
-  return transmissions == 521;
+  return transmissions == 512;
 }
 
 consteval bool test_bcm_8bit_transition0() {
-  // 8-bit depth, transition=0
-  // 8 + (1+2+4+8+16+32+64) = 8 + 127 = 135
+  // 8-bit depth, transition=0: 1 + (1+2+4+8+16+32+64) = 1 + 127 = 128
   constexpr int transmissions = I2sDma::calculate_bcm_transmissions(8, 0);
-  return transmissions == 135;
+  return transmissions == 128;
 }
 
 consteval bool test_bcm_8bit_transition1() {
-  // 8-bit, transition=1: bits 0-1 shown 1× each, bits 2-7 get BCM weighting
-  // 8 + (1+2+4+8+16+32) = 8 + 63 = 71
+  // 8-bit, transition=1: 2 + (1+2+4+8+16+32) = 2 + 63 = 65
   constexpr int transmissions = I2sDma::calculate_bcm_transmissions(8, 1);
-  return transmissions == 71;
+  return transmissions == 65;
 }
 
 consteval bool test_bcm_8bit_transition2() {
-  // 8-bit, transition=2: bits 0-2 shown 1× each, bits 3-7 get BCM weighting
-  // 8 + (1+2+4+8+16) = 8 + 31 = 39
+  // 8-bit, transition=2: 3 + (1+2+4+8+16) = 3 + 31 = 34
   constexpr int transmissions = I2sDma::calculate_bcm_transmissions(8, 2);
-  return transmissions == 39;
+  return transmissions == 34;
 }
 
 // Static assertions
-static_assert(test_bcm_12bit_transition0(), "BCM: 12-bit/transition=0 should produce 2059 transmissions");
-static_assert(test_bcm_10bit_transition0(), "BCM: 10-bit/transition=0 should produce 521 transmissions");
-static_assert(test_bcm_8bit_transition0(), "BCM: 8-bit/transition=0 should produce 135 transmissions");
-static_assert(test_bcm_8bit_transition1(), "BCM: 8-bit/transition=1 should produce 71 transmissions");
-static_assert(test_bcm_8bit_transition2(), "BCM: 8-bit/transition=2 should produce 39 transmissions");
+static_assert(test_bcm_12bit_transition0(), "BCM: 12-bit/transition=0 should produce 2048 transmissions");
+static_assert(test_bcm_10bit_transition0(), "BCM: 10-bit/transition=0 should produce 512 transmissions");
+static_assert(test_bcm_8bit_transition0(), "BCM: 8-bit/transition=0 should produce 128 transmissions");
+static_assert(test_bcm_8bit_transition1(), "BCM: 8-bit/transition=1 should produce 65 transmissions");
+static_assert(test_bcm_8bit_transition2(), "BCM: 8-bit/transition=2 should produce 34 transmissions");
 
 }  // namespace
 #endif  // ESP_IDF_VERSION_MAJOR >= 5
